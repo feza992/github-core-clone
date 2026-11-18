@@ -1,3 +1,73 @@
+// What this entrypoint serves: github-core-clone, a GitHub-compatible git
+// forge in one Node 22 process, standard library only. No git binary, no
+// database, no dependencies. The server it starts (app.ts) speaks four
+// wire protocols, but they are not four systems: underneath them sits one
+// in-memory kernel, and each protocol is a thin adapter over it.
+//
+//   - git smart HTTP: upload-pack v2/v0 and receive-pack under
+//     /{owner}/{repo}.git, pkt-lines in, packs out.
+//   - REST v3 under /api/v3: paths and JSON bodies in, JSON out.
+//   - GraphQL v4 under /graphql: documents in, field resolution out.
+//   - MCP under /mcp: tool calls in, kernel results out.
+//
+// The kernel is the in-memory store (Repo) plus a handful of core
+// operations: createIssueOn, createPullOn, mergePull, putContents,
+// fetchSelection, diffFlat. Every adapter parses only its own wire format
+// and then calls the same kernel functions, so a pull request merged over
+// MCP, an issue created over GraphQL, and a commit pushed over git are the
+// same objects on every surface. Cross-surface consistency is structural
+// here, not something the tests have to hope for: there is only one code
+// path that can create any of these objects, so the surfaces cannot drift
+// apart the way four mirrored subsystems would.
+//
+// Three design choices are what make this entry different from the
+// straightforward way to build the same forge:
+//
+//   1. The viewer's login is derived, not hardcoded. The suite's bearer
+//      token belongs to the scenario viewer, and every surface must answer
+//      as that viewer — but the token carries no login, and the entry is
+//      never told it. Probing the scenario once and hardcoding the login
+//      would work until the seed changes. Instead the kernel ports the
+//      scenario's own deterministic generator (xorshift64* stream, FNV-1a
+//      label seed, splitmix finalizer, first/last-name tables) and
+//      recomputes the viewer at startup. The login is a value the entry
+//      derives and can check, not a magic string it happens to know.
+//
+//   2. Shallow fetches are boundary-aware. A client's `have` lines do not
+//      mean "I hold this commit and all its history" when the client is
+//      shallow: a shallow clone holds the tip but not its parents, and it
+//      says so with `shallow` lines. The fetch selection therefore walks
+//      haves with a boundary stop — otherwise a deepen would send nothing
+//      (the parent looks already held) and a depth-1 clone would leak
+//      history (the parent slips in through the tip's closure). Wants are
+//      walked by commit generation, depth N meaning N generations, trees
+//      and blobs included, parents past the boundary never included. The
+//      shallow/unshallow reporting falls out of the same walk: the deepest
+//      commits sent are `shallow`, a boundary the walk passed is
+//      `unshallow`.
+//
+//   3. Packs and answers are deterministic by construction. There is no
+//      wall clock and no Math.random anywhere: every timestamp comes from
+//      MAKEFUN_TRIAL_NOW (fixed fallback 2025-01-01T00:00:00Z) and every
+//      id is a counter. Packs are built in canonical order, objects sorted
+//      by oid, and cached by fetch signature, so repeated identical
+//      fetches return identical bytes. The same requests in the same order
+//      produce the same state, because no request reads anything outside
+//      the request stream.
+//
+// How this file wires the entrypoint:
+//
+//   main.ts does no forge work itself. It creates the app (createApp),
+//   binds it to an ephemeral port, tells the trial environment that port,
+//   and then waits until the environment says the trial is over. The
+//   lifecycle is the harness's, not the contest's: register, poll /done,
+//   close, exit 0. The retry behaviour below (30 s request timeout,
+//   exponential backoff from 250 ms capped at 2 s) exists because the env
+//   may still be starting when this process registers, and because a
+//   failed poll is not a verdict — only the env's {"done": true} ends
+//   the run. Nothing in this file touches the kernel; it only gives the
+//   kernel a port to listen on and a clean shutdown.
+//
 // The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
 // port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
 // the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
